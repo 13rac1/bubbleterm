@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
@@ -178,10 +179,10 @@ func (e *Emulator) GetScreen() EmittedFrame {
 		return EmittedFrame{Rows: e.lastRows}
 	}
 
-	rendered := e.vt.Render()
+	rows := e.renderCells()
+	rendered := strings.Join(rows, "\n")
 	e.damaged = false
 
-	// Check for changes
 	var damage []LineDamage
 	if rendered != e.lastRender {
 		damage = make([]LineDamage, e.height)
@@ -196,38 +197,59 @@ func (e *Emulator) GetScreen() EmittedFrame {
 		e.lastRender = rendered
 	}
 
-	rows := splitIntoRows(rendered, e.height, e.width)
 	e.lastRows = rows
 	return EmittedFrame{Rows: rows, Damage: damage}
 }
 
-// splitIntoRows splits the rendered output into individual rows and pads to width
-func splitIntoRows(rendered string, height, width int) []string {
-	rows := make([]string, height)
-	lines := strings.Split(rendered, "\n")
-	emptyRow := strings.Repeat(" ", width)
+// renderCells iterates the vt emulator's cell grid directly, producing one
+// ANSI-styled string per row. This bypasses vt.Render() (which delegates to
+// ultraviolet's renderLine) because renderLine discards trailing unstyled
+// spaces and does not apply the terminal's BackgroundColor to empty cells.
+func (e *Emulator) renderCells() []string {
+	bg := e.vt.BackgroundColor()
+	rows := make([]string, e.height)
 
-	for i := range height {
-		if i < len(lines) && lines[i] != "" {
-			rows[i] = padRow(lines[i], width)
-		} else {
-			rows[i] = emptyRow
+	for y := 0; y < e.height; y++ {
+		var buf strings.Builder
+		var pen uv.Style
+
+		for x := 0; x < e.width; {
+			cell := e.vt.CellAt(x, y)
+
+			var style uv.Style
+			content := " "
+			width := 1
+
+			if cell != nil && !cell.IsZero() {
+				style = cell.Style
+				if cell.Content != "" {
+					content = cell.Content
+				}
+				if cell.Width > 1 {
+					width = cell.Width
+				}
+			}
+
+			// Apply terminal background to cells without an explicit one.
+			if style.Bg == nil && bg != nil {
+				style.Bg = bg
+			}
+
+			if seq := uv.StyleDiff(&pen, &style); seq != "" {
+				buf.WriteString(seq)
+				pen = style
+			}
+			buf.WriteString(content)
+			x += width
 		}
+
+		if !pen.IsZero() {
+			buf.WriteString(ansi.ResetStyle)
+		}
+		rows[y] = buf.String()
 	}
 
 	return rows
-}
-
-// padRow pads a row to the specified width, accounting for ANSI escape codes.
-// It always appends a SGR reset (\033[0m) before any trailing spaces so that
-// active attributes (e.g. underline, bold) from the row's content do not bleed
-// into the padding or into subsequent rows when rows are joined with \n.
-func padRow(row string, width int) string {
-	const reset = "\033[0m"
-	if visibleLen := ansi.StringWidth(row); visibleLen < width {
-		return row + reset + strings.Repeat(" ", width-visibleLen)
-	}
-	return row + reset
 }
 
 // Cursor returns the current cursor position and whether the cursor is visible.
