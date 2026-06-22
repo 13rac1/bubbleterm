@@ -2,6 +2,7 @@ package emulator
 
 import (
 	"fmt"
+	"image/color"
 	"io"
 	"os"
 	"os/exec"
@@ -51,6 +52,14 @@ type Emulator struct {
 
 	// Screen dimensions
 	width, height int
+
+	// Cursor state tracked via vt callbacks. These fields are written inside
+	// e.vt.Write calls, which ptyReadLoop always makes under e.mu.Lock.
+	// Readers use e.mu.RLock as normal.
+	cursorHidden bool
+	cursorStyle  vt.CursorStyle
+	cursorSteady bool // true = not blinking; zero value (false) = blinking, matching DEC default
+	cursorColor  color.Color
 }
 
 // EmittedFrame represents a rendered frame from the terminal.
@@ -59,8 +68,8 @@ type EmittedFrame struct {
 	Damage []LineDamage // Lines that changed since the last GetScreen call
 }
 
-// New creates a new headless terminal emulator
-func New(cols, rows int) (*Emulator, error) {
+// newEmulator creates a base Emulator with common fields and cursor callbacks.
+func newEmulator(cols, rows int) *Emulator {
 	e := &Emulator{
 		vt:        vt.NewEmulator(cols, rows),
 		id:        uuid.New().String(),
@@ -70,6 +79,23 @@ func New(cols, rows int) (*Emulator, error) {
 		height:    rows,
 		damaged:   true, // Initial render needed
 	}
+	// NOTE: the vt.Callbacks.CursorStyle callback parameter is named "blink"
+	// in the upstream API, but screen.go passes !blink (i.e. steady). We
+	// store it as cursorSteady and invert when returning CursorAppearance.
+	e.vt.SetCallbacks(vt.Callbacks{
+		CursorVisibility: func(visible bool) { e.cursorHidden = !visible },
+		CursorStyle: func(style vt.CursorStyle, steady bool) {
+			e.cursorStyle = style
+			e.cursorSteady = steady
+		},
+		CursorColor: func(c color.Color) { e.cursorColor = c },
+	})
+	return e
+}
+
+// New creates a new headless terminal emulator
+func New(cols, rows int) (*Emulator, error) {
+	e := newEmulator(cols, rows)
 
 	var err error
 	e.pty, e.tty, err = pty.Open()
@@ -96,18 +122,10 @@ func New(cols, rows int) (*Emulator, error) {
 // process is already running and you have access to its stdin/stdout pipes.
 // The caller is responsible for closing the reader when the process exits.
 func NewFromPipes(cols, rows int, r io.Reader, w io.WriteCloser) (*Emulator, error) {
-	e := &Emulator{
-		vt:        vt.NewEmulator(cols, rows),
-		id:        uuid.New().String(),
-		frameRate: time.Second / 30,
-		stopChan:  make(chan struct{}),
-		reader:    r,
-		writer:    w,
-		isPipe:    true,
-		width:     cols,
-		height:    rows,
-		damaged:   true,
-	}
+	e := newEmulator(cols, rows)
+	e.reader = r
+	e.writer = w
+	e.isPipe = true
 
 	// Start the read loop using the provided reader and drain terminal
 	// responses (for queries like DA/DSR) back to the remote process.
@@ -235,9 +253,19 @@ func (e *Emulator) Cursor() (Pos, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	pos := e.vt.CursorPosition()
-	// The vt package doesn't expose cursor visibility directly in a simple way
-	// Default to visible
-	return Pos{X: pos.X, Y: pos.Y}, true
+	return Pos{X: pos.X, Y: pos.Y}, !e.cursorHidden
+}
+
+// CursorAppearance returns the current cursor shape, blink state, and color
+// as set by the running application via DECSCUSR and OSC 12.
+func (e *Emulator) CursorAppearance() CursorAppearance {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return CursorAppearance{
+		Style: CursorStyle(e.cursorStyle),
+		Blink: !e.cursorSteady,
+		Color: e.cursorColor,
+	}
 }
 
 // SetOnExit sets a callback function that will be called when the process exits
