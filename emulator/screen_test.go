@@ -3,6 +3,7 @@ package emulator
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os/exec"
 	"strconv"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/vt"
+	"github.com/creack/pty"
 )
 
 func TestEmulatorCreation(t *testing.T) {
@@ -752,5 +754,592 @@ func BenchmarkSplitIntoRows(b *testing.B) {
 
 	for b.Loop() {
 		splitIntoRows(rendered, 24, 80)
+	}
+}
+
+func TestCursorStateTracking(t *testing.T) {
+	e, err := New(80, 24)
+	if err != nil {
+		t.Fatalf("failed to create emulator: %v", err)
+	}
+	defer e.Close()
+
+	// Initial: cursor visible, block style, not blinking, no color.
+	_, visible := e.Cursor()
+	if !visible {
+		t.Fatal("expected cursor visible initially")
+	}
+	ca := e.CursorAppearance()
+	if ca.Style != 0 {
+		t.Errorf("initial cursor style = %d, want 0 (block)", ca.Style)
+	}
+	if !ca.Blink {
+		t.Error("initial blink should be true (DEC default)")
+	}
+	if ca.Color != nil {
+		t.Errorf("initial cursor color = %v, want nil", ca.Color)
+	}
+
+	// Write DECTCEM off (hide cursor): CSI ?25l
+	e.mu.Lock()
+	e.vt.Write([]byte("\x1b[?25l"))
+	e.mu.Unlock()
+
+	_, visible = e.Cursor()
+	if visible {
+		t.Fatal("expected cursor hidden after DECTCEM off")
+	}
+
+	// Write DECSCUSR 5 (blinking bar): CSI 5 SP q
+	e.mu.Lock()
+	e.vt.Write([]byte("\x1b[5 q"))
+	e.mu.Unlock()
+
+	ca = e.CursorAppearance()
+	if ca.Style != 2 { // CursorBar
+		t.Errorf("cursor style = %d, want 2 (bar)", ca.Style)
+	}
+	if !ca.Blink {
+		t.Error("expected blink=true for DECSCUSR 5")
+	}
+
+	// Write DECSCUSR 6 (steady bar): CSI 6 SP q
+	e.mu.Lock()
+	e.vt.Write([]byte("\x1b[6 q"))
+	e.mu.Unlock()
+
+	ca = e.CursorAppearance()
+	if ca.Style != 2 { // CursorBar
+		t.Errorf("cursor style = %d, want 2 (bar)", ca.Style)
+	}
+	if ca.Blink {
+		t.Error("expected blink=false for DECSCUSR 6")
+	}
+
+	// Write OSC 12 (set cursor color): ESC ] 12 ; #ff6e63 BEL
+	e.mu.Lock()
+	e.vt.Write([]byte("\x1b]12;#ff6e63\x07"))
+	e.mu.Unlock()
+
+	ca = e.CursorAppearance()
+	if ca.Color == nil {
+		t.Fatal("expected non-nil cursor color after OSC 12")
+	}
+	r, g, b, _ := ca.Color.RGBA()
+	// colorful.Hex returns float-based color; RGBA shifts to 16-bit.
+	r8, g8, b8 := r>>8, g>>8, b>>8
+	if r8 != 0xff || g8 != 0x6e || b8 != 0x63 {
+		t.Errorf("cursor color = #%02x%02x%02x, want #ff6e63", r8, g8, b8)
+	}
+
+	// Write DECTCEM on (show cursor): CSI ?25h
+	e.mu.Lock()
+	e.vt.Write([]byte("\x1b[?25h"))
+	e.mu.Unlock()
+
+	_, visible = e.Cursor()
+	if !visible {
+		t.Fatal("expected cursor visible after DECTCEM on")
+	}
+}
+
+func TestCursorStateTrackingViaPipe(t *testing.T) {
+	// Simulate the real data flow: write escape sequences to the pipe reader,
+	// let ptyReadLoop process them, and verify cursor state.
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Write a batch of escape sequences like bubbletea would:
+	// DECTCEM off, DECSCUSR 5 (blinking bar), OSC 12 (red), content, cursor move, DECTCEM on
+	batch := strings.Join([]string{
+		"\x1b[?25l",           // hide cursor
+		"\x1b[5 q",            // blinking bar
+		"\x1b]12;#ff6e63\x07", // cursor color red
+		"Hello",               // some content
+		"\x1b[1;1H",           // move cursor to 1,1
+		"\x1b[?25h",           // show cursor
+	}, "")
+
+	if _, err := pw.Write([]byte(batch)); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+
+	// Poll until ptyReadLoop processes the data.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, visible := e.Cursor(); visible {
+			if ca := e.CursorAppearance(); ca.Style == 2 && ca.Color != nil {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, visible := e.Cursor()
+	if !visible {
+		t.Fatal("expected cursor visible")
+	}
+
+	ca := e.CursorAppearance()
+	if ca.Style != 2 {
+		t.Errorf("cursor style = %d, want 2 (bar)", ca.Style)
+	}
+	if !ca.Blink {
+		t.Error("expected blink=true")
+	}
+	if ca.Color == nil {
+		t.Fatal("expected non-nil cursor color")
+	}
+	r, g, b, _ := ca.Color.RGBA()
+	r8, g8, b8 := r>>8, g>>8, b>>8
+	if r8 != 0xff || g8 != 0x6e || b8 != 0x63 {
+		t.Errorf("cursor color = #%02x%02x%02x, want #ff6e63", r8, g8, b8)
+	}
+}
+
+func TestCursorDECSCUSRMapping(t *testing.T) {
+	// DECSCUSR parameter values:
+	//   0 = default (blinking block per DEC spec)
+	//   1 = blinking block
+	//   2 = steady block
+	//   3 = blinking underline
+	//   4 = steady underline
+	//   5 = blinking bar
+	//   6 = steady bar
+	tests := []struct {
+		param     int
+		wantStyle int  // 0=block, 1=underline, 2=bar
+		wantBlink bool // true=blinking, false=steady
+	}{
+		{0, 0, true},  // default → blinking block
+		{1, 0, true},  // blinking block
+		{2, 0, false}, // steady block
+		{3, 1, true},  // blinking underline
+		{4, 1, false}, // steady underline
+		{5, 2, true},  // blinking bar
+		{6, 2, false}, // steady bar
+	}
+
+	e, err := New(80, 24)
+	if err != nil {
+		t.Fatalf("failed to create emulator: %v", err)
+	}
+	defer e.Close()
+
+	for _, tt := range tests {
+		// Send DECSCUSR: CSI Ps SP q
+		seq := fmt.Sprintf("\x1b[%d q", tt.param)
+		e.mu.Lock()
+		e.vt.Write([]byte(seq))
+		e.mu.Unlock()
+
+		ca := e.CursorAppearance()
+		if int(ca.Style) != tt.wantStyle {
+			t.Errorf("DECSCUSR %d: style = %d, want %d", tt.param, ca.Style, tt.wantStyle)
+		}
+		if ca.Blink != tt.wantBlink {
+			t.Errorf("DECSCUSR %d: blink = %v, want %v", tt.param, ca.Blink, tt.wantBlink)
+		}
+	}
+}
+
+func TestCursorColorReset(t *testing.T) {
+	e, err := New(80, 24)
+	if err != nil {
+		t.Fatalf("failed to create emulator: %v", err)
+	}
+	defer e.Close()
+
+	// Set cursor color via OSC 12.
+	e.mu.Lock()
+	e.vt.Write([]byte("\x1b]12;#ff0000\x07"))
+	e.mu.Unlock()
+
+	ca := e.CursorAppearance()
+	if ca.Color == nil {
+		t.Fatal("expected non-nil cursor color after OSC 12")
+	}
+	r, _, _, _ := ca.Color.RGBA()
+	if r>>8 != 0xff {
+		t.Errorf("expected red cursor, got red=%d", r>>8)
+	}
+
+	// Reset cursor color via OSC 112.
+	// The vt package resets to defaultCur (color.White), not nil.
+	e.mu.Lock()
+	e.vt.Write([]byte("\x1b]112\x07"))
+	e.mu.Unlock()
+
+	ca = e.CursorAppearance()
+	if ca.Color == nil {
+		t.Fatal("expected non-nil cursor color after OSC 112 (vt resets to default white)")
+	}
+	r, g, b, _ := ca.Color.RGBA()
+	r8, g8, b8 := r>>8, g>>8, b>>8
+	if r8 != 0xff || g8 != 0xff || b8 != 0xff {
+		t.Errorf("expected white (#ffffff) after reset, got #%02x%02x%02x", r8, g8, b8)
+	}
+}
+
+func TestCursorStateAfterInterleavedHideShow(t *testing.T) {
+	// Simulate the pattern bubbletea uses: hide → set style → content → show.
+	// After this sequence, cursor should be visible with the new style.
+	e, err := New(80, 24)
+	if err != nil {
+		t.Fatalf("failed to create emulator: %v", err)
+	}
+	defer e.Close()
+
+	// Write a batch: hide, change style, some content, show.
+	batch := strings.Join([]string{
+		"\x1b[?25l",           // hide
+		"\x1b[5 q",            // blinking bar
+		"\x1b]12;#00ff00\x07", // green cursor
+		"some content here",
+		"\x1b[?25h", // show
+	}, "")
+
+	e.mu.Lock()
+	e.vt.Write([]byte(batch))
+	e.mu.Unlock()
+
+	// Final state should be: visible, blinking bar, green.
+	_, visible := e.Cursor()
+	if !visible {
+		t.Fatal("expected cursor visible after hide→show batch")
+	}
+
+	ca := e.CursorAppearance()
+	if ca.Style != 2 {
+		t.Errorf("style = %d, want 2 (bar)", ca.Style)
+	}
+	if !ca.Blink {
+		t.Error("expected blink=true")
+	}
+	if ca.Color == nil {
+		t.Fatal("expected non-nil color")
+	}
+	r, g, b, _ := ca.Color.RGBA()
+	r8, g8, b8 := r>>8, g>>8, b>>8
+	if r8 != 0x00 || g8 != 0xff || b8 != 0x00 {
+		t.Errorf("cursor color = #%02x%02x%02x, want #00ff00", r8, g8, b8)
+	}
+}
+
+func TestCursorSequenceSplitAcrossWrites(t *testing.T) {
+	// Escape sequences split across multiple Write calls should still be
+	// parsed correctly by the vt state machine.
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Split "\x1b[5 q" (DECSCUSR 5 = blinking bar) across two writes.
+	// The sleep between writes lets ptyReadLoop consume the first fragment
+	// before the second arrives, ensuring they are delivered as separate reads.
+	if _, err := pw.Write([]byte("\x1b[5")); err != nil {
+		t.Fatalf("pipe write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := pw.Write([]byte(" q")); err != nil {
+		t.Fatalf("pipe write: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ca := e.CursorAppearance(); ca.Style == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ca := e.CursorAppearance()
+	if ca.Style != 2 {
+		t.Errorf("split sequence: style = %d, want 2 (bar)", ca.Style)
+	}
+	if !ca.Blink {
+		t.Error("split sequence: expected blink=true")
+	}
+
+	// Split OSC 12 color across two writes.
+	if _, err := pw.Write([]byte("\x1b]12;#ab")); err != nil {
+		t.Fatalf("pipe write: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, err := pw.Write([]byte("cdef\x07")); err != nil {
+		t.Fatalf("pipe write: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if ca := e.CursorAppearance(); ca.Color != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	ca = e.CursorAppearance()
+	if ca.Color == nil {
+		t.Fatal("split OSC 12: expected non-nil color")
+	}
+	r, g, b, _ := ca.Color.RGBA()
+	r8, g8, b8 := r>>8, g>>8, b>>8
+	if r8 != 0xab || g8 != 0xcd || b8 != 0xef {
+		t.Errorf("split OSC 12: color = #%02x%02x%02x, want #abcdef", r8, g8, b8)
+	}
+}
+
+func TestDamageOnCursorMoveOnly(t *testing.T) {
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Write visible content and wait for ptyReadLoop to process it.
+	if _, err := pw.Write([]byte("Hello")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := e.GetScreen()
+		if strings.Contains(strings.Join(frame.Rows, ""), "Hello") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Drain any remaining damage.
+	e.GetScreen()
+
+	// Write a space — cursor moves but cell was already visually a space.
+	if _, err := pw.Write([]byte(" ")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var frame EmittedFrame
+	for time.Now().Before(deadline) {
+		frame = e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(frame.Damage) == 0 {
+		t.Fatal("expected damage after cursor-only move (space at empty position)")
+	}
+	if frame.Damage[0].Reason != CRCursor {
+		t.Errorf("damage reason = %d, want CRCursor (%d)", frame.Damage[0].Reason, CRCursor)
+	}
+
+	// Next call with no new writes should have no damage.
+	frame = e.GetScreen()
+	if len(frame.Damage) != 0 {
+		t.Fatalf("expected no damage on second call, got %d", len(frame.Damage))
+	}
+}
+
+func TestDamageOnCursorVisibilityChange(t *testing.T) {
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Drain initial damage.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Hide cursor — no content change.
+	if _, err := pw.Write([]byte("\x1b[?25l")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var frame EmittedFrame
+	for time.Now().Before(deadline) {
+		frame = e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(frame.Damage) == 0 {
+		t.Fatal("expected damage after cursor visibility change")
+	}
+	if frame.Damage[0].Reason != CRCursor {
+		t.Errorf("damage reason = %d, want CRCursor (%d)", frame.Damage[0].Reason, CRCursor)
+	}
+}
+
+func TestDamageOnCursorColorChange(t *testing.T) {
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Drain initial damage.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Send OSC 12 to change cursor color — no content change.
+	if _, err := pw.Write([]byte("\x1b]12;#ff0000\x07")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var frame EmittedFrame
+	for time.Now().Before(deadline) {
+		frame = e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(frame.Damage) == 0 {
+		t.Fatal("expected damage after cursor color change")
+	}
+	if frame.Damage[0].Reason != CRCursor {
+		t.Errorf("damage reason = %d, want CRCursor (%d)", frame.Damage[0].Reason, CRCursor)
+	}
+}
+
+func TestDamageReasonContentAndCursorChange(t *testing.T) {
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Drain initial damage.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Write visible content — changes both content and cursor position.
+	if _, err := pw.Write([]byte("Hello")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var frame EmittedFrame
+	for time.Now().Before(deadline) {
+		frame = e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(frame.Damage) == 0 {
+		t.Fatal("expected damage after content+cursor change")
+	}
+	// When both content and cursor changed, reason should be CRText.
+	if frame.Damage[0].Reason != CRText {
+		t.Errorf("damage reason = %d, want CRText (%d)", frame.Damage[0].Reason, CRText)
+	}
+}
+
+func TestCursorStateTrackingViaPTY(t *testing.T) {
+	// Test the exact production path: a real PTY pair with NewFromPipes.
+	// The multiplexer passes the pty (master) side to NewFromPipes as both
+	// reader and writer, while the tty (slave) side is connected to podman.
+	// Here we simulate the container writing escape sequences to the tty side.
+	ptmx, tty, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open failed: %v", err)
+	}
+	defer tty.Close()
+
+	e, err := NewFromPipes(80, 24, ptmx, ptmx)
+	if err != nil {
+		ptmx.Close()
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Write escape sequences to the tty side, simulating container output.
+	// This goes through the PTY kernel layer (just like in production).
+	batch := strings.Join([]string{
+		"\x1b[?25l",           // DECTCEM hide
+		"\x1b[H\x1b[2J",       // Clear screen
+		"\x1b[1;1H",           // Home cursor
+		"Hello World",         // Some content
+		"\x1b]12;#ff6e63\x07", // OSC 12: cursor color red
+		"\x1b[5 q",            // DECSCUSR 5: blinking bar
+		"\x1b[2;1H",           // Position cursor at row 2
+		"\x1b[?25h",           // DECTCEM show
+	}, "")
+
+	if _, err := tty.Write([]byte(batch)); err != nil {
+		t.Fatalf("tty write failed: %v", err)
+	}
+
+	// Poll until ptyReadLoop processes the data through the PTY kernel.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, visible := e.Cursor(); visible {
+			if ca := e.CursorAppearance(); ca.Style == 2 && ca.Color != nil {
+				break
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	_, visible := e.Cursor()
+	if !visible {
+		t.Fatal("expected cursor visible after DECTCEM show via PTY")
+	}
+
+	ca := e.CursorAppearance()
+	if ca.Style != 2 { // CursorBar
+		t.Errorf("cursor style = %d, want 2 (bar)", ca.Style)
+	}
+	if !ca.Blink {
+		t.Error("expected blink=true for DECSCUSR 5")
+	}
+
+	if ca.Color == nil {
+		t.Fatal("expected non-nil cursor color via PTY")
+	}
+	r, g, b, _ := ca.Color.RGBA()
+	r8, g8, b8 := r>>8, g>>8, b>>8
+	if r8 != 0xff || g8 != 0x6e || b8 != 0x63 {
+		t.Errorf("cursor color = #%02x%02x%02x, want #ff6e63", r8, g8, b8)
 	}
 }
