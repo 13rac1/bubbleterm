@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
@@ -61,15 +60,14 @@ type Emulator struct {
 	processExited bool
 	onExit        func(string) // Callback when process exits, receives emulator ID
 
-	// Framerate control
-	frameRate time.Duration
-	stopChan  chan struct{}
+	stopChan chan struct{}
 
 	// Damage tracking for change detection
 	lastRender string
 	lastRows   []string
 	lastCursor cursorSnapshot
 	damaged    bool
+	notifyC    chan struct{} // signaled when new damage occurs
 
 	// Screen dimensions
 	width, height int
@@ -92,13 +90,13 @@ type EmittedFrame struct {
 // newEmulator creates a base Emulator with common fields and cursor callbacks.
 func newEmulator(cols, rows int) *Emulator {
 	e := &Emulator{
-		vt:        vt.NewEmulator(cols, rows),
-		id:        uuid.New().String(),
-		frameRate: time.Second / 30, // Default 30 FPS
-		stopChan:  make(chan struct{}),
-		width:     cols,
-		height:    rows,
-		damaged:   true, // Initial render needed
+		vt:       vt.NewEmulator(cols, rows),
+		id:       uuid.New().String(),
+		stopChan: make(chan struct{}),
+		notifyC:  make(chan struct{}, 1),
+		width:    cols,
+		height:   rows,
+		damaged:  true, // Initial render needed
 	}
 	// NOTE: the vt.Callbacks.CursorStyle callback parameter is named "blink"
 	// in the upstream API, but screen.go passes !blink (i.e. steady). We
@@ -188,21 +186,19 @@ func (e *Emulator) resize(cols, rows int) error {
 	e.vt.Resize(cols, rows)
 	e.width = cols
 	e.height = rows
-	e.damaged = true
+	e.markDamaged()
 
 	return nil
 }
 
-// SetFrameRate sets the internal render loop framerate.
-// fps must be greater than 0.
-func (e *Emulator) SetFrameRate(fps int) error {
-	if fps < 1 {
-		return ErrInvalidFrameRate
+// markDamaged sets the damaged flag and signals notifyC.
+// Must be called with mu held.
+func (e *Emulator) markDamaged() {
+	e.damaged = true
+	select {
+	case e.notifyC <- struct{}{}:
+	default:
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.frameRate = time.Second / time.Duration(fps)
-	return nil
 }
 
 // GetScreen returns the current rendered screen as ANSI strings.
@@ -525,6 +521,14 @@ func (e *Emulator) Done() <-chan struct{} {
 	return e.stopChan
 }
 
+// NotifyChanged returns a channel that receives a value each time the
+// emulator's screen content changes. The channel is buffered (size 1) so
+// a single pending notification is coalesced when multiple writes arrive
+// before the consumer reads.
+func (e *Emulator) NotifyChanged() <-chan struct{} {
+	return e.notifyC
+}
+
 func (e *Emulator) pipeResponseLoop() {
 	buf := make([]byte, 4096)
 	for {
@@ -565,7 +569,7 @@ func (e *Emulator) ptyReadLoop() {
 		if n > 0 {
 			e.mu.Lock()
 			e.vt.Write(buf[:n])
-			e.damaged = true
+			e.markDamaged()
 			e.mu.Unlock()
 		}
 	}
