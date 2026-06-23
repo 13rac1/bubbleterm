@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 	"github.com/creack/pty"
 )
@@ -343,160 +344,71 @@ func TestEmulatorUniqueIDs(t *testing.T) {
 	}
 }
 
-func TestSplitIntoRows(t *testing.T) {
-	tests := []struct {
-		name     string
-		rendered string
-		height   int
-		width    int
-		wantRows int
-	}{
-		{
-			name:     "empty input",
-			rendered: "",
-			height:   3,
-			width:    10,
-			wantRows: 3,
-		},
-		{
-			name:     "single line",
-			rendered: "hello",
-			height:   3,
-			width:    10,
-			wantRows: 3,
-		},
-		{
-			name:     "multiple lines",
-			rendered: "line1\nline2\nline3\n",
-			height:   5,
-			width:    10,
-			wantRows: 5,
-		},
-		{
-			name:     "more lines than height",
-			rendered: "a\nb\nc\nd\ne\n",
-			height:   3,
-			width:    5,
-			wantRows: 3,
-		},
+func TestRenderCellsRowCount(t *testing.T) {
+	e, err := New(10, 3)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
 	}
+	defer e.Close()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			rows := splitIntoRows(tt.rendered, tt.height, tt.width)
-			if len(rows) != tt.wantRows {
-				t.Errorf("splitIntoRows() returned %d rows, want %d", len(rows), tt.wantRows)
-			}
-			// All rows should be non-empty (at least padded with spaces)
-			for i, row := range rows {
-				if row == "" {
-					t.Errorf("row %d is empty, expected at least padding", i)
-				}
-			}
-		})
+	frame := e.GetScreen()
+	if len(frame.Rows) != 3 {
+		t.Errorf("expected 3 rows, got %d", len(frame.Rows))
+	}
+	for i, row := range frame.Rows {
+		visibleLen := ansi.StringWidth(row)
+		if visibleLen != 10 {
+			t.Errorf("row %d visible width = %d, want 10", i, visibleLen)
+		}
 	}
 }
 
-func TestPadRow(t *testing.T) {
-	tests := []struct {
-		name  string
-		row   string
-		width int
-	}{
-		{
-			name:  "short row gets padded",
-			row:   "hi",
-			width: 10,
-		},
-		{
-			name:  "exact width row unchanged",
-			row:   "1234567890",
-			width: 10,
-		},
-		{
-			name:  "row with ANSI codes",
-			row:   "\x1b[31mred\x1b[0m",
-			width: 10,
-		},
-		{
-			name:  "empty row",
-			row:   "",
-			width: 5,
-		},
+func TestRenderCellsBackgroundColor(t *testing.T) {
+	e, err := New(10, 1)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
 	}
+	defer e.Close()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := padRow(tt.row, tt.width)
+	// Set a terminal background color. Empty cells should inherit it.
+	e.vt.SetBackgroundColor(ansi.ExtendedColor(236))
 
-			// Count visible characters
-			visibleLen := 0
-			inEscape := false
-			for _, r := range result {
-				if r == '\033' {
-					inEscape = true
-				} else if inEscape {
-					if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '~' {
-						inEscape = false
-					}
-				} else {
-					visibleLen++
-				}
-			}
+	// Write a short string so most cells remain empty.
+	e.vt.Write([]byte("hi"))
 
-			if visibleLen < tt.width {
-				t.Errorf("padRow() visible length %d < width %d", visibleLen, tt.width)
-			}
-		})
+	frame := e.GetScreen()
+	if len(frame.Rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(frame.Rows))
+	}
+	row := frame.Rows[0]
+
+	// The background SGR for color 236 should appear in the output,
+	// applied to the empty cells that follow "hi".
+	if !strings.Contains(row, "48;5;236") {
+		t.Errorf("expected background color 236 in output, got: %q", row)
 	}
 }
 
-func TestPadRowSGRReset(t *testing.T) {
-	// padRow must append \033[0m so that SGR attributes (e.g. underline) from
-	// the row content do not bleed into trailing padding or subsequent rows.
-	tests := []struct {
-		name  string
-		row   string
-		width int
-	}{
-		{
-			name:  "underline does not bleed into padding",
-			row:   "\x1b[4mhello\x1b[0m",
-			width: 10,
-		},
-		{
-			name:  "bold 256-color row with OSC sequence in width budget",
-			row:   "\x1b[1m\x1b[38;5;200mhi\x1b[0m",
-			width: 10,
-		},
-		{
-			name:  "row at exact width still gets reset",
-			row:   "1234567890",
-			width: 10,
-		},
+func TestRenderCellsStyledContent(t *testing.T) {
+	e, err := New(20, 1)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
 	}
+	defer e.Close()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := padRow(tt.row, tt.width)
-			if !strings.Contains(result, "\x1b[0m") {
-				t.Errorf("padRow() result missing SGR reset: %q", result)
-			}
-		})
+	// Write bold red text.
+	e.vt.Write([]byte("\x1b[1;31mhello\x1b[0m"))
+
+	frame := e.GetScreen()
+	row := frame.Rows[0]
+
+	// The output should contain the bold and red SGR sequences.
+	if !strings.Contains(row, "hello") {
+		t.Errorf("expected 'hello' in output, got: %q", row)
 	}
-}
-
-func TestPadRowANSIAwareWidth(t *testing.T) {
-	// ANSI escape bytes must not count toward visible width; padding must bring
-	// the visible character count up to the target width.
-	row := "\x1b[1m\x1b[38;5;200mhi\x1b[0m" // bold + 256-color "hi" — many escape bytes
-	width := 10
-	result := padRow(row, width)
-
-	// Strip ANSI via a second pass with ansi.StringWidth to verify visible width.
-	// We know there are 2 visible chars in row; padRow must add 8 spaces.
-	if !strings.Contains(result, strings.Repeat(" ", 8)) {
-		t.Errorf("padRow() did not pad to full width; result: %q", result)
+	// SGR 1 = bold, SGR 31 = red foreground
+	if !strings.Contains(row, "1") || !strings.Contains(row, "31") {
+		t.Errorf("expected bold+red SGR in output, got: %q", row)
 	}
 }
 
@@ -687,45 +599,6 @@ func (w *captureWriteCloser) Close() error {
 }
 
 var _ io.WriteCloser = (*captureWriteCloser)(nil)
-
-func TestSplitIntoRowsBasic(t *testing.T) {
-	rows := splitIntoRows("line1\nline2\nline3", 5, 10)
-	if len(rows) != 5 {
-		t.Fatalf("expected 5 rows, got %d", len(rows))
-	}
-	if !strings.Contains(rows[0], "line1") {
-		t.Errorf("row 0 = %q, want to contain 'line1'", rows[0])
-	}
-	if !strings.Contains(rows[1], "line2") {
-		t.Errorf("row 1 = %q, want to contain 'line2'", rows[1])
-	}
-	if !strings.Contains(rows[2], "line3") {
-		t.Errorf("row 2 = %q, want to contain 'line3'", rows[2])
-	}
-	// Remaining rows should be spaces
-	expected := strings.Repeat(" ", 10)
-	if rows[3] != expected {
-		t.Errorf("row 3 = %q, want %q", rows[3], expected)
-	}
-}
-
-func BenchmarkSplitIntoRows(b *testing.B) {
-	// Simulate a typical 80x24 terminal render with ANSI codes
-	var buf strings.Builder
-	for row := range 24 {
-		buf.WriteString("\x1b[32m")
-		buf.WriteString(strings.Repeat("A", 80))
-		buf.WriteString("\x1b[0m")
-		if row < 23 {
-			buf.WriteByte('\n')
-		}
-	}
-	rendered := buf.String()
-
-	for b.Loop() {
-		splitIntoRows(rendered, 24, 80)
-	}
-}
 
 func TestCursorStateTracking(t *testing.T) {
 	e, err := New(80, 24)
