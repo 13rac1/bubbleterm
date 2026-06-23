@@ -17,6 +17,26 @@ import (
 	"github.com/google/uuid"
 )
 
+// cursorSnapshot holds the cursor state for change detection in GetScreen.
+type cursorSnapshot struct {
+	x, y    int
+	visible bool
+	style   vt.CursorStyle
+	steady  bool
+	color   color.Color
+}
+
+// colorsEqual compares two color.Color values by their RGBA components,
+// avoiding interface comparison which panics on non-comparable concrete types.
+func colorsEqual(a, b color.Color) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	ar, ag, ab, aa := a.RGBA()
+	br, bg, bb, ba := b.RGBA()
+	return ar == br && ag == bg && ab == bb && aa == ba
+}
+
 // Emulator is a headless terminal emulator that maintains internal state
 // and renders to a framebuffer instead of directly to screen
 type Emulator struct {
@@ -48,6 +68,7 @@ type Emulator struct {
 	// Damage tracking for change detection
 	lastRender string
 	lastRows   []string
+	lastCursor cursorSnapshot
 	damaged    bool
 
 	// Screen dimensions
@@ -195,27 +216,42 @@ func (e *Emulator) GetScreen() EmittedFrame {
 	if !e.damaged {
 		return EmittedFrame{Rows: e.lastRows}
 	}
-
-	rendered := e.vt.Render()
 	e.damaged = false
 
-	// Check for changes
-	var damage []LineDamage
-	if rendered != e.lastRender {
-		damage = make([]LineDamage, e.height)
-		for y := 0; y < e.height; y++ {
-			damage[y] = LineDamage{
-				Row:    y,
-				X1:     0,
-				X2:     e.width,
-				Reason: CRText,
-			}
-		}
-		e.lastRender = rendered
+	rendered := e.vt.Render()
+	rows := splitIntoRows(rendered, e.height, e.width)
+
+	cpos := e.vt.CursorPosition()
+	snap := cursorSnapshot{
+		x:       cpos.X,
+		y:       cpos.Y,
+		visible: !e.cursorHidden,
+		style:   e.cursorStyle,
+		steady:  e.cursorSteady,
+		color:   e.cursorColor,
+	}
+	contentChanged := rendered != e.lastRender
+	cursorChanged := snap.x != e.lastCursor.x || snap.y != e.lastCursor.y ||
+		snap.visible != e.lastCursor.visible || snap.style != e.lastCursor.style ||
+		snap.steady != e.lastCursor.steady || !colorsEqual(snap.color, e.lastCursor.color)
+
+	e.lastRender = rendered
+	e.lastCursor = snap
+	e.lastRows = rows
+
+	if !contentChanged && !cursorChanged {
+		return EmittedFrame{Rows: rows}
 	}
 
-	rows := splitIntoRows(rendered, e.height, e.width)
-	e.lastRows = rows
+	reason := CRText
+	if cursorChanged && !contentChanged {
+		reason = CRCursor
+	}
+
+	damage := make([]LineDamage, e.height)
+	for y := range damage {
+		damage[y] = LineDamage{Row: y, X1: 0, X2: e.width, Reason: reason}
+	}
 	return EmittedFrame{Rows: rows, Damage: damage}
 }
 

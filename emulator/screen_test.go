@@ -1099,6 +1099,182 @@ func TestCursorSequenceSplitAcrossWrites(t *testing.T) {
 	}
 }
 
+func TestDamageOnCursorMoveOnly(t *testing.T) {
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Write visible content and wait for ptyReadLoop to process it.
+	if _, err := pw.Write([]byte("Hello")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := e.GetScreen()
+		if strings.Contains(strings.Join(frame.Rows, ""), "Hello") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Drain any remaining damage.
+	e.GetScreen()
+
+	// Write a space — cursor moves but cell was already visually a space.
+	if _, err := pw.Write([]byte(" ")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var frame EmittedFrame
+	for time.Now().Before(deadline) {
+		frame = e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(frame.Damage) == 0 {
+		t.Fatal("expected damage after cursor-only move (space at empty position)")
+	}
+	if frame.Damage[0].Reason != CRCursor {
+		t.Errorf("damage reason = %d, want CRCursor (%d)", frame.Damage[0].Reason, CRCursor)
+	}
+
+	// Next call with no new writes should have no damage.
+	frame = e.GetScreen()
+	if len(frame.Damage) != 0 {
+		t.Fatalf("expected no damage on second call, got %d", len(frame.Damage))
+	}
+}
+
+func TestDamageOnCursorVisibilityChange(t *testing.T) {
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Drain initial damage.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Hide cursor — no content change.
+	if _, err := pw.Write([]byte("\x1b[?25l")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var frame EmittedFrame
+	for time.Now().Before(deadline) {
+		frame = e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(frame.Damage) == 0 {
+		t.Fatal("expected damage after cursor visibility change")
+	}
+	if frame.Damage[0].Reason != CRCursor {
+		t.Errorf("damage reason = %d, want CRCursor (%d)", frame.Damage[0].Reason, CRCursor)
+	}
+}
+
+func TestDamageOnCursorColorChange(t *testing.T) {
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Drain initial damage.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Send OSC 12 to change cursor color — no content change.
+	if _, err := pw.Write([]byte("\x1b]12;#ff0000\x07")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var frame EmittedFrame
+	for time.Now().Before(deadline) {
+		frame = e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(frame.Damage) == 0 {
+		t.Fatal("expected damage after cursor color change")
+	}
+	if frame.Damage[0].Reason != CRCursor {
+		t.Errorf("damage reason = %d, want CRCursor (%d)", frame.Damage[0].Reason, CRCursor)
+	}
+}
+
+func TestDamageReasonContentAndCursorChange(t *testing.T) {
+	pr, pw := io.Pipe()
+	writer := &testWriter{}
+
+	e, err := NewFromPipes(80, 24, pr, writer)
+	if err != nil {
+		t.Fatalf("NewFromPipes failed: %v", err)
+	}
+	defer e.Close()
+
+	// Drain initial damage.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		frame := e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Write visible content — changes both content and cursor position.
+	if _, err := pw.Write([]byte("Hello")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	var frame EmittedFrame
+	for time.Now().Before(deadline) {
+		frame = e.GetScreen()
+		if len(frame.Damage) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(frame.Damage) == 0 {
+		t.Fatal("expected damage after content+cursor change")
+	}
+	// When both content and cursor changed, reason should be CRText.
+	if frame.Damage[0].Reason != CRText {
+		t.Errorf("damage reason = %d, want CRText (%d)", frame.Damage[0].Reason, CRText)
+	}
+}
+
 func TestCursorStateTrackingViaPTY(t *testing.T) {
 	// Test the exact production path: a real PTY pair with NewFromPipes.
 	// The multiplexer passes the pty (master) side to NewFromPipes as both
