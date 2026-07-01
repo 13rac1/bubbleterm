@@ -309,19 +309,15 @@ func (e *Emulator) StartCommand(cmd *exec.Cmd) error {
 	}
 
 	// Start monitoring the process in a goroutine
-	go e.monitorProcess()
+	go e.monitorProcess(cmd)
 
 	return nil
 }
 
 // monitorProcess waits for the process to exit and calls the exit callback
-func (e *Emulator) monitorProcess() {
-	if e.cmd == nil {
-		return
-	}
-
+func (e *Emulator) monitorProcess(cmd *exec.Cmd) {
 	// Wait for the process to exit
-	_ = e.cmd.Wait()
+	_ = cmd.Wait()
 
 	e.mu.Lock()
 	e.processExited = true
