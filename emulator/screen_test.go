@@ -708,6 +708,31 @@ func TestSplitIntoRowsBasic(t *testing.T) {
 	}
 }
 
+// TestMonitorProcessRace verifies that monitorProcess does not race on e.cmd.
+// Before the fix, monitorProcess read e.cmd without the mutex while
+// StartCommand wrote it under the lock — detectable by `go test -race`.
+func TestMonitorProcessRace(t *testing.T) {
+	e, err := New(80, 24)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer e.Close()
+
+	cmd := exec.Command("sleep", "0.01")
+	if err := e.StartCommand(cmd); err != nil {
+		t.Fatalf("StartCommand: %v", err)
+	}
+
+	// monitorProcess reads e.cmd without the mutex (lines 319, 324).
+	// This write under the lock has no happens-before ordering with that
+	// unsynchronized read, so the race detector flags it.
+	e.mu.Lock()
+	e.cmd = cmd
+	e.mu.Unlock()
+
+	time.Sleep(50 * time.Millisecond)
+}
+
 func BenchmarkSplitIntoRows(b *testing.B) {
 	// Simulate a typical 80x24 terminal render with ANSI codes
 	var buf strings.Builder
