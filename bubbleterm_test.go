@@ -830,6 +830,133 @@ func TestPollTerminalBlocksUntilDamage(t *testing.T) {
 	}
 }
 
+func TestModelUpdateDirectMouseMessages(t *testing.T) {
+	pr, _ := io.Pipe()
+	_, iw := io.Pipe()
+	model, err := NewWithPipes(80, 24, pr, iw)
+	if err != nil {
+		t.Fatalf("NewWithPipes failed: %v", err)
+	}
+	defer model.Close()
+
+	msgs := []tea.Msg{
+		tea.MouseClickMsg{X: 1, Y: 2, Button: tea.MouseLeft},
+		tea.MouseReleaseMsg{X: 1, Y: 2, Button: tea.MouseLeft},
+		tea.MouseMotionMsg{X: 3, Y: 4},
+	}
+
+	// Focused — should produce commands.
+	for _, msg := range msgs {
+		_, cmd := model.Update(msg)
+		if cmd == nil {
+			t.Fatalf("expected command for %T", msg)
+		}
+	}
+
+	// Blurred — should be ignored.
+	model.Blur()
+	for _, msg := range msgs {
+		_, cmd := model.Update(msg)
+		if cmd != nil {
+			t.Fatalf("expected no command for %T when blurred", msg)
+		}
+	}
+}
+
+func TestModelUpdateTranslatedMouseClickRelease(t *testing.T) {
+	pr, _ := io.Pipe()
+	_, iw := io.Pipe()
+	model, err := NewWithPipes(80, 24, pr, iw)
+	if err != nil {
+		t.Fatalf("NewWithPipes failed: %v", err)
+	}
+	defer model.Close()
+
+	id := model.emulator.ID()
+	msgs := []translatedMouseMsg{
+		{EmulatorID: id, OriginalMsg: tea.MouseClickMsg{Button: tea.MouseLeft}, X: 1, Y: 2},
+		{EmulatorID: id, OriginalMsg: tea.MouseReleaseMsg{Button: tea.MouseLeft}, X: 1, Y: 2},
+	}
+
+	for _, msg := range msgs {
+		_, cmd := model.Update(msg)
+		if cmd == nil {
+			t.Fatalf("expected command for translated %T", msg.OriginalMsg)
+		}
+	}
+
+	// Blurred translated mouse should be ignored.
+	model.Blur()
+	_, cmd := model.Update(msgs[0])
+	if cmd != nil {
+		t.Fatal("expected no command for translated mouse when blurred")
+	}
+}
+
+func TestModelUpdateProcessesStartCommandMsg(t *testing.T) {
+	model, err := New(80, 24)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer model.Close()
+
+	_, cmd := model.Update(startCommandMsg{
+		Cmd:        exec.Command("true"),
+		EmulatorID: model.emulator.ID(),
+	})
+	if cmd != nil {
+		t.Fatal("expected no follow-up command from startCommandMsg")
+	}
+	if model.err != nil {
+		t.Fatalf("expected no error, got %v", model.err)
+	}
+}
+
+func TestModelUpdateIgnoresWrongEmulatorID(t *testing.T) {
+	model, err := New(80, 24)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer model.Close()
+
+	// startCommandMsg with wrong ID.
+	_, cmd := model.Update(startCommandMsg{
+		Cmd:        exec.Command("true"),
+		EmulatorID: "other",
+	})
+	if cmd != nil {
+		t.Fatal("expected no command for startCommandMsg with wrong emulator ID")
+	}
+
+	// terminalErrorMsg with wrong ID.
+	_, cmd = model.Update(terminalErrorMsg{
+		Err:        exec.ErrNotFound,
+		EmulatorID: "other",
+	})
+	if cmd != nil {
+		t.Fatal("expected no command for terminalErrorMsg with wrong emulator ID")
+	}
+	if model.err != nil {
+		t.Fatal("expected error not set for wrong emulator ID")
+	}
+}
+
+func TestModelUpdateUnknownKeyNoCommand(t *testing.T) {
+	pr, _ := io.Pipe()
+	_, iw := io.Pipe()
+	model, err := NewWithPipes(80, 24, pr, iw)
+	if err != nil {
+		t.Fatalf("NewWithPipes failed: %v", err)
+	}
+	defer model.Close()
+
+	// F13 is not mapped — keyToTerminalInput returns "".
+	_, cmd := model.Update(tea.KeyPressMsg{Code: tea.KeyF13})
+	if cmd != nil {
+		t.Fatal("expected no command for unmapped key")
+	}
+}
+
 func TestCloseNilEmulator(t *testing.T) {
 	model := &Model{}
 	if err := model.Close(); err != nil {
