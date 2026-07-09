@@ -836,8 +836,8 @@ func TestCursorStateTracking(t *testing.T) {
 		t.Fatal("expected cursor visible initially")
 	}
 	ca := e.CursorAppearance()
-	if ca.Style != 0 {
-		t.Errorf("initial cursor style = %d, want 0 (block)", ca.Style)
+	if ca.Style != CursorBlock {
+		t.Errorf("initial cursor style = %d, want %d (block)", ca.Style, CursorBlock)
 	}
 	if !ca.Blink {
 		t.Error("initial blink should be true (DEC default)")
@@ -858,8 +858,8 @@ func TestCursorStateTracking(t *testing.T) {
 	e.vt.Write([]byte("\x1b[5 q"))
 	e.mu.Unlock()
 	ca = e.CursorAppearance()
-	if ca.Style != 2 {
-		t.Errorf("cursor style = %d, want 2 (bar)", ca.Style)
+	if ca.Style != CursorBar {
+		t.Errorf("cursor style = %d, want CursorBar", ca.Style)
 	}
 	if !ca.Blink {
 		t.Error("expected blink=true for DECSCUSR 5")
@@ -869,8 +869,8 @@ func TestCursorStateTracking(t *testing.T) {
 	e.vt.Write([]byte("\x1b[6 q"))
 	e.mu.Unlock()
 	ca = e.CursorAppearance()
-	if ca.Style != 2 {
-		t.Errorf("cursor style = %d, want 2 (bar)", ca.Style)
+	if ca.Style != CursorBar {
+		t.Errorf("cursor style = %d, want CursorBar", ca.Style)
 	}
 	if ca.Blink {
 		t.Error("expected blink=false for DECSCUSR 6")
@@ -916,7 +916,7 @@ func TestCursorStateTrackingViaPipe(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, visible := e.Cursor(); visible {
-			if ca := e.CursorAppearance(); ca.Style == 2 && ca.Color != nil {
+			if ca := e.CursorAppearance(); ca.Style == CursorBar && ca.Color != nil {
 				break
 			}
 		}
@@ -928,8 +928,8 @@ func TestCursorStateTrackingViaPipe(t *testing.T) {
 		t.Fatal("expected cursor visible")
 	}
 	ca := e.CursorAppearance()
-	if ca.Style != 2 {
-		t.Errorf("cursor style = %d, want 2 (bar)", ca.Style)
+	if ca.Style != CursorBar {
+		t.Errorf("cursor style = %d, want CursorBar", ca.Style)
 	}
 	if !ca.Blink {
 		t.Error("expected blink=true")
@@ -947,12 +947,12 @@ func TestCursorStateTrackingViaPipe(t *testing.T) {
 func TestCursorDECSCUSRMapping(t *testing.T) {
 	tests := []struct {
 		param     int
-		wantStyle int
+		wantStyle CursorStyle
 		wantBlink bool
 	}{
-		{0, 0, true}, {1, 0, true}, {2, 0, false},
-		{3, 1, true}, {4, 1, false},
-		{5, 2, true}, {6, 2, false},
+		{0, CursorBlock, true}, {1, CursorBlock, true}, {2, CursorBlock, false},
+		{3, CursorUnderline, true}, {4, CursorUnderline, false},
+		{5, CursorBar, true}, {6, CursorBar, false},
 	}
 
 	e, err := New(80, 24)
@@ -967,7 +967,7 @@ func TestCursorDECSCUSRMapping(t *testing.T) {
 		e.mu.Unlock()
 
 		ca := e.CursorAppearance()
-		if int(ca.Style) != tt.wantStyle {
+		if ca.Style != tt.wantStyle {
 			t.Errorf("DECSCUSR %d: style = %d, want %d", tt.param, ca.Style, tt.wantStyle)
 		}
 		if ca.Blink != tt.wantBlink {
@@ -1028,8 +1028,8 @@ func TestCursorStateAfterInterleavedHideShow(t *testing.T) {
 		t.Fatal("expected cursor visible after hide→show batch")
 	}
 	ca := e.CursorAppearance()
-	if ca.Style != 2 {
-		t.Errorf("style = %d, want 2 (bar)", ca.Style)
+	if ca.Style != CursorBar {
+		t.Errorf("style = %d, want CursorBar", ca.Style)
 	}
 	if !ca.Blink {
 		t.Error("expected blink=true")
@@ -1054,25 +1054,33 @@ func TestCursorSequenceSplitAcrossWrites(t *testing.T) {
 	}
 	defer e.Close()
 
-	pw.Write([]byte("\x1b[5"))
+	if _, err := pw.Write([]byte("\x1b[5")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
 	time.Sleep(50 * time.Millisecond)
-	pw.Write([]byte(" q"))
+	if _, err := pw.Write([]byte(" q")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if ca := e.CursorAppearance(); ca.Style == 2 {
+		if ca := e.CursorAppearance(); ca.Style == CursorBar {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	ca := e.CursorAppearance()
-	if ca.Style != 2 {
-		t.Errorf("split sequence: style = %d, want 2 (bar)", ca.Style)
+	if ca.Style != CursorBar {
+		t.Errorf("split sequence: style = %d, want CursorBar", ca.Style)
 	}
 
-	pw.Write([]byte("\x1b]12;#ab"))
+	if _, err := pw.Write([]byte("\x1b]12;#ab")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
 	time.Sleep(50 * time.Millisecond)
-	pw.Write([]byte("cdef\x07"))
+	if _, err := pw.Write([]byte("cdef\x07")); err != nil {
+		t.Fatalf("pipe write failed: %v", err)
+	}
 
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1112,7 +1120,8 @@ func TestDamageOnCursorMoveOnly(t *testing.T) {
 	}
 	e.GetScreen() // drain remaining damage
 
-	pw.Write([]byte(" "))
+	// Move cursor without changing content (CUP to row 1, col 10).
+	pw.Write([]byte("\x1b[1;10H"))
 	deadline = time.Now().Add(2 * time.Second)
 	var frame EmittedFrame
 	for time.Now().Before(deadline) {
@@ -1265,7 +1274,7 @@ func TestCursorStateTrackingViaPTY(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, visible := e.Cursor(); visible {
-			if ca := e.CursorAppearance(); ca.Style == 2 && ca.Color != nil {
+			if ca := e.CursorAppearance(); ca.Style == CursorBar && ca.Color != nil {
 				break
 			}
 		}
@@ -1277,8 +1286,8 @@ func TestCursorStateTrackingViaPTY(t *testing.T) {
 		t.Fatal("expected cursor visible after DECTCEM show via PTY")
 	}
 	ca := e.CursorAppearance()
-	if ca.Style != 2 {
-		t.Errorf("cursor style = %d, want 2 (bar)", ca.Style)
+	if ca.Style != CursorBar {
+		t.Errorf("cursor style = %d, want CursorBar", ca.Style)
 	}
 	if !ca.Blink {
 		t.Error("expected blink=true for DECSCUSR 5")

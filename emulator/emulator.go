@@ -21,9 +21,23 @@ import (
 type cursorSnapshot struct {
 	x, y    int
 	visible bool
-	style   vt.CursorStyle
-	steady  bool
-	color   color.Color
+	style  vt.CursorStyle
+	steady bool
+	color  color.Color
+}
+
+// cursorStyleFromVT maps upstream vt.CursorStyle to our CursorStyle.
+// An explicit switch avoids a silent int cast that would break if the
+// upstream iota order ever changes.
+func cursorStyleFromVT(s vt.CursorStyle) CursorStyle {
+	switch s {
+	case vt.CursorUnderline:
+		return CursorUnderline
+	case vt.CursorBar:
+		return CursorBar
+	default:
+		return CursorBlock
+	}
 }
 
 // colorsEqual compares two color.Color values by their RGBA components,
@@ -99,8 +113,11 @@ func newEmulator(cols, rows int) *Emulator {
 		height:   rows,
 		damaged:  true, // Initial render needed
 	}
+	e.lastRows = splitIntoRows("", cols, rows)
 	e.vt.SetCallbacks(vt.Callbacks{
 		CursorVisibility: func(visible bool) { e.cursorHidden = !visible },
+		// NOTE: upstream declares this parameter as "blink" but actually
+		// passes !blink (steady). See charmbracelet/x/vt screen.go:251.
 		CursorStyle: func(style vt.CursorStyle, steady bool) {
 			e.cursorStyle = style
 			e.cursorSteady = steady
@@ -216,7 +233,6 @@ func (e *Emulator) GetScreen() EmittedFrame {
 
 	rendered := e.vt.Render()
 	e.damaged = false
-	rows := splitIntoRows(rendered, e.height, e.width)
 
 	cpos := e.vt.CursorPosition()
 	snap := cursorSnapshot{
@@ -232,12 +248,15 @@ func (e *Emulator) GetScreen() EmittedFrame {
 		snap.visible != e.lastCursor.visible || snap.style != e.lastCursor.style ||
 		snap.steady != e.lastCursor.steady || !colorsEqual(snap.color, e.lastCursor.color)
 
-	e.lastRender = rendered
 	e.lastCursor = snap
-	e.lastRows = rows
 
 	if !contentChanged && !cursorChanged {
-		return EmittedFrame{Rows: rows}
+		return EmittedFrame{Rows: e.lastRows}
+	}
+
+	if contentChanged {
+		e.lastRender = rendered
+		e.lastRows = splitIntoRows(rendered, e.height, e.width)
 	}
 
 	reason := CRText
@@ -249,7 +268,7 @@ func (e *Emulator) GetScreen() EmittedFrame {
 	for y := range damage {
 		damage[y] = LineDamage{Row: y, X1: 0, X2: e.width, Reason: reason}
 	}
-	return EmittedFrame{Rows: rows, Damage: damage}
+	return EmittedFrame{Rows: e.lastRows, Damage: damage}
 }
 
 // splitIntoRows splits the rendered output into individual rows and pads to width
@@ -322,7 +341,7 @@ func (e *Emulator) CursorAppearance() CursorAppearance {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return CursorAppearance{
-		Style: CursorStyle(e.cursorStyle),
+		Style: cursorStyleFromVT(e.cursorStyle),
 		Blink: !e.cursorSteady,
 		Color: e.cursorColor,
 	}
