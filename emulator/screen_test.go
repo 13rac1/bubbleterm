@@ -700,6 +700,44 @@ func TestRenderCellsStyledContent(t *testing.T) {
 	}
 }
 
+func TestRenderCellsCachesUntouchedRows(t *testing.T) {
+	e, err := New(40, 10)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer e.Close()
+
+	// Write to row 0 only, leaving rows 1–9 untouched.
+	e.mu.Lock()
+	e.vt.Write([]byte("hello"))
+	e.damaged = true
+	e.mu.Unlock()
+
+	frame1 := e.GetScreen()
+	if !strings.Contains(frame1.Rows[0], "hello") {
+		t.Fatalf("expected 'hello' in row 0, got: %q", frame1.Rows[0])
+	}
+
+	// Second render without new writes — rows should be cached.
+	e.mu.Lock()
+	e.damaged = true // force re-entry into renderCells
+	e.mu.Unlock()
+
+	frame2 := e.GetScreen()
+
+	// Untouched rows must be identical across renders.
+	for y := 1; y < 10; y++ {
+		if frame2.Rows[y] != frame1.Rows[y] {
+			t.Errorf("row %d changed unexpectedly: %q vs %q", y, frame1.Rows[y], frame2.Rows[y])
+		}
+	}
+
+	// Row 0 was touched, so it's re-rendered (content should still match).
+	if !strings.Contains(frame2.Rows[0], "hello") {
+		t.Errorf("row 0 lost content after re-render: %q", frame2.Rows[0])
+	}
+}
+
 func BenchmarkRenderCells(b *testing.B) {
 	e, err := New(80, 24)
 	if err != nil {

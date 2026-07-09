@@ -201,14 +201,25 @@ func (e *Emulator) GetScreen() EmittedFrame {
 }
 
 // renderCells iterates the vt emulator's cell grid directly, producing one
-// ANSI-styled string per row. This bypasses vt.Render() because renderLine
+// ANSI-styled string per row.
+//
+// TODO(upstream): This exists because vt.Render() (via ultraviolet renderLine)
 // discards trailing unstyled spaces and does not apply the terminal's
-// BackgroundColor to empty cells.
+// BackgroundColor() to empty cells. Once upstream fixes background rendering
+// in renderLine, replace this with vt.Render() — which also clears Touched()
+// state automatically, making per-row caching fully effective.
 func (e *Emulator) renderCells() []string {
+	touched := e.vt.Touched()
 	bg := e.vt.BackgroundColor()
 	rows := make([]string, e.height)
 
 	for y := 0; y < e.height; y++ {
+		if y < len(touched) && touched[y] == nil &&
+			y < len(e.lastRows) && e.lastRows[y] != "" {
+			rows[y] = e.lastRows[y]
+			continue
+		}
+
 		var buf strings.Builder
 		var pen uv.Style
 
